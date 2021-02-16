@@ -5,6 +5,7 @@
 #include "asio_wrapper/timer.h"
 #include "message.h"
 #include "log.h"
+#include "third_party/json.hpp"
 #include <sstream>
 #include <cstdlib>
 #include <algorithm>
@@ -79,6 +80,15 @@ RaftNode::RaftNode(asio::io_context& io) : state_(RaftNode::State::Init),
       BecomeFollower();
     }
   });
+
+  server_.SetOnMessage([this](std::shared_ptr<puck::TcpConnection> con) -> void {
+    this->OnMessage(con);
+  });
+
+  server_.SetOnClose([this](std::shared_ptr<puck::TcpConnection> con) -> void {
+    this->NodeLeave(con);
+  });
+
   // 开启client，连接id比自己小的服务器
   for(uint64_t i = 0; i < my_id_; ++i) {
     std::string iport = get_iport_from_id(i);
@@ -100,14 +110,7 @@ RaftNode::RaftNode(asio::io_context& io) : state_(RaftNode::State::Init),
     });
 
     client->SetOnClose([this](std::shared_ptr<puck::TcpConnection> con) -> void {
-      INFO("close connection : ", con->Iport());
-      uint64_t id = con->getContext<uint64_t>();
-      other_nodes_.equal_range(id);
-      if(con->GetState() == puck::TcpConnection::ConnState::ReadZero) {
-        INFO("tcp connection state : read_zero");
-      } else {
-        WARN("tcp connection state : ", con->GetStateStr());
-      }
+      this->NodeLeave(con);
     });
 
     client->Connect();
@@ -127,8 +130,8 @@ void RaftNode::StartFollowerTimer() {
     if(ec) {
       ERROR("asio timer error : ", ec.message());
     }
+    assert(state_ == State::Follower);
     if(leader_visited_ == true) {
-      assert(state_ == State::Follower);
       leader_visited_ = false;
       StartFollowerTimer();
     } else {
@@ -152,11 +155,62 @@ void RaftNode::RunForLeader() {
   RequestVote rv;
   rv.term = current_term_;
   rv.candidate_id = my_id_;
-  // TODO : implement log entry componment.
-  // rv.lastxxx = xxx
+  rv.last_log_index = logs_.GetLastLogIndex();
+  rv.last_log_term = logs_.GetLastLogTerm();
+
   std::string message = CreateRequestVote(rv);
   for(auto& each : other_nodes_) {
     each.second->Send(message);
+  }
+}
+
+void RaftNode::OnMessage(std::shared_ptr<puck::TcpConnection> con) {
+  if(state_ == State::Init) {
+    ERROR("get message from ", con->Iport(), " in state init.");
+  } else if(state_ == State::Follower) {
+    OnMessageFollower(con);
+  } else if(state_ == State::Candidate) {
+    OnMessageCandidate(con);
+  } else if(state_ == State::Leader) {
+    OnMessageLeader(con);
+  } else {
+    ERROR("get message from unknow state.");
+  }
+}
+
+using json = nlohmann::json;
+
+void RaftNode::OnMessageFollower(std::shared_ptr<puck::TcpConnection> con) {
+  std::string message(con->MessageData(), con->MessageLength());
+  json j = json::parse(message);
+  if(j["type"].get<std::string>() == "request_vote") {
+    RequestVote rv = GetRequestVote(j);
+    // reply true or false and restart follower timeout.
+  } else if(j["type"] == "append_entries") {
+    // new leader send heartbeat. restart follower timeout.
+  } else {
+
+  }
+}
+
+void RaftNode::OnMessageCandidate(std::shared_ptr<puck::TcpConnection> con) {
+  std::string message(con->MessageData(), con->MessageLength());
+  json j = json::parse(message);
+}
+
+void RaftNode::OnMessageLeader(std::shared_ptr<puck::TcpConnection> con) {
+  std::string message(con->MessageData(), con->MessageLength());
+  json j = json::parse(message);
+}
+
+void RaftNode::NodeLeave(std::shared_ptr<puck::TcpConnection> con) {
+  INFO("close connection : ", con->Iport());
+  uint64_t id = con->getContext<uint64_t>();
+  other_nodes_.erase(id);
+  if(con->GetState() == puck::TcpConnection::ConnState::ReadZero) {
+    INFO("tcp connection state : read_zero");
+  } else {
+    WARN("tcp connection state : ", con->GetStateStr());
   }
 }
 }

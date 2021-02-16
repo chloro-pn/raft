@@ -3,8 +3,11 @@
 
 #include <string>
 #include <cstdint>
+#include "third_party/json.hpp"
 
 namespace raft {
+using json = nlohmann::json;
+
 struct RequestVote {
   uint64_t term;
   uint64_t candidate_id;
@@ -14,7 +17,7 @@ struct RequestVote {
 
 std::string CreateRequestVote(const RequestVote& rv);
 
-RequestVote GetRequestVote(const std::string& str);
+RequestVote GetRequestVote(const json& str);
 
 struct RequestVoteReply {
   uint64_t term;
@@ -23,7 +26,7 @@ struct RequestVoteReply {
 
 std::string CreateRequestVoteReply(const RequestVoteReply& rvr);
 
-RequestVoteReply GetRVReply(const std::string& str);
+RequestVoteReply GetRequestVoteReply(const json& str);
 }
 
 #endif // MESSAGE_H

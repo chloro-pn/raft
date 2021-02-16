@@ -11,6 +11,7 @@
 #include "log.h"
 #include "asio_wrapper/server.h"
 #include "asio_wrapper/client.h"
+#include "command_storage.h"
 
 namespace raft {
 class RaftNodeContext {
@@ -57,6 +58,16 @@ public:
 
   void StartCandidateTimer();
 
+  void OnMessage(std::shared_ptr<puck::TcpConnection> con);
+
+  void OnMessageFollower(std::shared_ptr<puck::TcpConnection> con);
+
+  void OnMessageCandidate(std::shared_ptr<puck::TcpConnection> con);
+
+  void OnMessageLeader(std::shared_ptr<puck::TcpConnection> con);
+
+  void NodeLeave(std::shared_ptr<puck::TcpConnection> con);
+
 private:
   State state_;
   asio::io_context& io_;
@@ -67,6 +78,8 @@ private:
   uint64_t current_term_;
   // voted_for_ == -1 means not vote in current term.
   int64_t voted_for_;
+  CommandStorage logs_;
+
   puck::Server server_;
   std::vector<std::shared_ptr<puck::Client>> clients_;
 
