@@ -27,6 +27,19 @@ struct RequestVoteReply {
 std::string CreateRequestVoteReply(const RequestVoteReply& rvr);
 
 RequestVoteReply GetRequestVoteReply(const json& str);
+
+struct AppendEntries {
+  uint64_t term;
+  uint64_t leader_id;
+  uint64_t prev_log_index;
+  uint64_t prev_log_term;
+  std::vector<std::string> entries;
+  uint64_t leader_commit;
+};
+
+std::string CreateAppendEntries(const AppendEntries& ae);
+AppendEntries GetAppendEntries(const json& str);
+
 }
 
 #endif // MESSAGE_H

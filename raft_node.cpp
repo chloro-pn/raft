@@ -53,7 +53,7 @@ static bool all_connected(uint64_t count) {
 }
 
 // random timeout from 150 to 200 ms.
-static asio::chrono::microseconds get_random_follower_timeout() {
+static asio::chrono::microseconds get_random_election_timeout() {
   return asio::chrono::microseconds(puck::util::GetRandomFromTo(150, 200));
 }
 
@@ -64,7 +64,8 @@ RaftNode::RaftNode(asio::io_context& io) : state_(RaftNode::State::Init),
                                            current_term_(0),
                                            voted_for_(-1),
                                            server_(io_, get_server_port_from_config()),
-                                           leader_visited_(false) {
+                                           leader_visited_(false),
+                                           voted_count_(0) {
   server_.SetOnConnection([this](std::shared_ptr<puck::TcpConnection> con) -> void {
     INFO("new connection : ", con->Iport());
     uint64_t nid = get_id_from_iport(con->Iport());
@@ -125,8 +126,12 @@ void RaftNode::BecomeFollower() {
 }
 
 void RaftNode::StartFollowerTimer() {
-  asio::chrono::microseconds ms = get_random_follower_timeout();
-  puck::Timer<asio::chrono::microseconds> timer([this](const asio::error_code& ec) -> void {
+  assert(state_ == State::Follower);
+  if(timer_handle_) {
+    timer_handle_->Cancel();
+  }
+  asio::chrono::seconds s = asio::chrono::seconds(5);
+  std::shared_ptr<timer_type> timer = std::make_shared<timer_type>([this](const asio::error_code& ec) -> void {
     if(ec) {
       ERROR("asio timer error : ", ec.message());
     }
@@ -138,20 +143,34 @@ void RaftNode::StartFollowerTimer() {
       // become candidate and try to run for leader.
       BecomeCandidate();
     }
-  }, io_, ms);
+  }, io_, s);
+  timer_handle_ = timer->Start();
+  leader_visited_ = false;
 }
 
 void RaftNode::BecomeCandidate() {
   // 只能从follower变成candidate状态
   assert(state_ == State::Follower);
-  INFO("node ", my_id_, " become candidate from ", GetStateStr());
-  IncreaseTerm();
-  state_ = State::Candidate;
-  RunForLeader();
+  asio::chrono::microseconds ms = get_random_election_timeout();
+  std::shared_ptr<timer_type> timer = std::make_shared<timer_type>([this](const asio::error_code& ec) -> void {
+    if(ec) {
+      ERROR("asio timer error : ", ec.message());
+    }
+    INFO("node ", my_id_, " become candidate from ", GetStateStr());
+    RunForLeader();
+  }, io_, ms);
+  timer_handle_ = timer->Start();
 }
 
 void RaftNode::RunForLeader() {
-  assert(state_ == State::Candidate);
+  IncreaseTerm();
+  state_ = State::Candidate;
+  ++current_term_;
+  voted_count_ = 0;
+  // vote for myself
+  voted_for_ = my_id_;
+  ++voted_count_;
+
   RequestVote rv;
   rv.term = current_term_;
   rv.candidate_id = my_id_;
@@ -162,6 +181,7 @@ void RaftNode::RunForLeader() {
   for(auto& each : other_nodes_) {
     each.second->Send(message);
   }
+  // TODO 开启Candidate timeout.
 }
 
 void RaftNode::OnMessage(std::shared_ptr<puck::TcpConnection> con) {
@@ -185,17 +205,132 @@ void RaftNode::OnMessageFollower(std::shared_ptr<puck::TcpConnection> con) {
   json j = json::parse(message);
   if(j["type"].get<std::string>() == "request_vote") {
     RequestVote rv = GetRequestVote(j);
-    // reply true or false and restart follower timeout.
+
+    RequestVoteReply rvr;
+    rvr.term = current_term_;
+    rvr.vote_granted = false;
+
+    int state = 0;
+    if(current_term_ == rv.term) {
+      state = 0;
+    } else if(current_term_ > rv.term) {
+      state = -1;
+    } else {
+      state = 1;
+    }
+
+    if(state == 1) {
+      if(rv.last_log_term >= logs_.GetLastLogTerm() ||
+         (rv.last_log_term == logs_.GetLastLogTerm() && rv.last_log_index == logs_.GetLastLogIndex())) {
+        rvr.vote_granted = true;
+        voted_for_ = rv.candidate_id;
+      } else {
+        voted_for_ = -1;
+      }
+    } else if(state == 0 && voted_for_ == -1) {
+      if(rv.last_log_term >= logs_.GetLastLogTerm() ||
+         (rv.last_log_term == logs_.GetLastLogTerm() && rv.last_log_index == logs_.GetLastLogIndex())) {
+        rvr.vote_granted = true;
+        voted_for_ = rv.candidate_id;
+      }
+    } else {
+      // 要么是过时消息， 要么是本term已经投过票
+    }
+
+    std::string reply_msg = CreateRequestVoteReply(rvr);
+    con->Send(reply_msg);
+    if(state <= 0) {
+      return;
+    } else {
+      // 进入新的term
+      current_term_ = rvr.term;
+      //关闭之前的timer，开启新的follower timeout timer.
+      if(!timer_handle_) {
+        ERROR("follower state but have no timeout.");
+      }
+      timer_handle_->Cancel();
+      StartFollowerTimer();
+    }
   } else if(j["type"] == "append_entries") {
     // new leader send heartbeat. restart follower timeout.
-  } else {
 
+  } else {
+    // 其他消息直接丢掉，因为有可能本节点刚从leader/candidate变成follower
   }
 }
 
 void RaftNode::OnMessageCandidate(std::shared_ptr<puck::TcpConnection> con) {
   std::string message(con->MessageData(), con->MessageLength());
   json j = json::parse(message);
+  if(j["type"].get<std::string>() == "request_vote_reply") {
+    RequestVoteReply rvr = GetRequestVoteReply(message);
+    if(rvr.term > current_term_) {
+      assert(rvr.vote_granted == false);
+      current_term_ = rvr.term;
+      voted_for_ = -1;
+      BecomeFollower();
+    } else {
+      // 是否应该只接受本term的投票
+      if(rvr.vote_granted == true) {
+        ++voted_count_;
+        // TODO : 如果收到过半通过票,BecomeLeader.
+        if(voted_count_ * 2 > puck::Config::instance().Nodes().size()) {
+
+        }
+      }
+    }
+  } else if(j["type"].get<std::string>() == "request_vote") {
+    RequestVote rv = GetRequestVote(j);
+
+    RequestVoteReply rvr;
+    rvr.term = current_term_;
+    rvr.vote_granted = false;
+
+    int state = 0;
+    if(current_term_ == rv.term) {
+      state = 0;
+    } else if(current_term_ > rv.term) {
+      state = -1;
+    } else {
+      state = 1;
+    }
+
+    if(state == 1) {
+      if(rv.last_log_term >= logs_.GetLastLogTerm() ||
+         (rv.last_log_term == logs_.GetLastLogTerm() && rv.last_log_index == logs_.GetLastLogIndex())) {
+        rvr.vote_granted = true;
+        voted_for_ = rv.candidate_id;
+      } else {
+        voted_for_ = -1;
+      }
+      // candidate状态下这个分支是不可能成立的，voted_for_ === my_id_.
+    } else if(state == 0 && voted_for_ == -1) {
+      if(rv.last_log_term >= logs_.GetLastLogTerm() ||
+         (rv.last_log_term == logs_.GetLastLogTerm() && rv.last_log_index == logs_.GetLastLogIndex())) {
+        rvr.vote_granted = true;
+        voted_for_ = rv.candidate_id;
+      }
+    } else {
+      // 要么是过时消息， 要么是本term已经投过票
+    }
+
+    std::string reply_msg = CreateRequestVoteReply(rvr);
+    con->Send(reply_msg);
+    if(state <= 0) {
+      return;
+    } else {
+      // 进入新的term
+      current_term_ = rvr.term;
+      //关闭之前的timer，开启新的follower timeout timer.
+      if(!timer_handle_) {
+        ERROR("candidate state but have no timeout.");
+      }
+      timer_handle_->Cancel();
+      StartFollowerTimer();
+    }
+  } else {
+
+  }
 }
 
 void RaftNode::OnMessageLeader(std::shared_ptr<puck::TcpConnection> con) {

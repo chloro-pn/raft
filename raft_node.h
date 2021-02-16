@@ -9,6 +9,7 @@
 #include <limits>
 #include "asio.hpp"
 #include "log.h"
+#include "asio_wrapper/timer.h"
 #include "asio_wrapper/server.h"
 #include "asio_wrapper/client.h"
 #include "command_storage.h"
@@ -84,6 +85,11 @@ private:
   std::vector<std::shared_ptr<puck::Client>> clients_;
 
   bool leader_visited_;
+  // used in candidate state.
+  uint64_t voted_count_;
+  using timer_type = puck::Timer<asio::chrono::microseconds>;
+  // 任何时候，Raft节点只有一个timer处于活动状态
+  std::shared_ptr<puck::TimerHandle> timer_handle_;
 };
 }
 
