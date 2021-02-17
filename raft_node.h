@@ -43,23 +43,23 @@ public:
 
   explicit RaftNode(asio::io_context& io);
 
-  void BecomeFollower();
+  void BecomeFollower(uint64_t new_term_);
 
   void StartFollowerTimer();
 
   void BecomeCandidate();
 
-  void IncreaseTerm() {
-    assert(std::numeric_limits<uint64_t>::max() > current_term_);
-    INFO("term from ", current_term_, " to ", current_term_ + 1);
-    ++current_term_;
-  }
-
   void RunForLeader();
 
   void StartCandidateTimer();
 
+  void BecomeLeader();
+
+  void StartLeaderTimer();
+
   void OnMessage(std::shared_ptr<puck::TcpConnection> con);
+
+  void OnMessageInit(std::shared_ptr<puck::TcpConnection> con);
 
   void OnMessageFollower(std::shared_ptr<puck::TcpConnection> con);
 
@@ -73,8 +73,8 @@ private:
   State state_;
   asio::io_context& io_;
 
-  size_t my_id_;
-  std::unordered_map<size_t, std::shared_ptr<puck::TcpConnection>> other_nodes_;
+  uint64_t my_id_;
+  std::unordered_map<uint64_t, std::shared_ptr<puck::TcpConnection>> other_nodes_;
 
   uint64_t current_term_;
   // voted_for_ == -1 means not vote in current term.

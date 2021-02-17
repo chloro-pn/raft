@@ -38,14 +38,17 @@ private:
   puck::Server server_;
 };
 
-int main() {
-  puck::Config::instance().Init("raft.config");
+int main(int argc, const char* argv[]) {
+  if(argc != 2) {
+    ERROR("input == config file");
+  }
+  puck::Config::instance().Init(argv[1]);
   asio::io_context io;
   //puck::Client client(io, "127.0.0.1", 12345);
   //client.SetRetry(5, 1);
   //client.Connect();
-  Echo echo(io);
-  //puck::RaftNode raft(io);
+  //Echo echo(io);
+  raft::RaftNode raft(io);
   io.run();
   return 0;
 }

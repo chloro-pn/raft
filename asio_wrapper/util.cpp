@@ -37,7 +37,7 @@ std::string GetIpFromIport(const std::string& iport) {
   size_t count = 0;
   for(count = 0; count < iport.size(); ++count) {
     if(iport[count] == ':') {
-      return iport.substr(0, count - 1);
+      return iport.substr(0, count);
     }
   }
   return "";

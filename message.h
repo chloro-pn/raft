@@ -17,7 +17,7 @@ struct RequestVote {
 
 std::string CreateRequestVote(const RequestVote& rv);
 
-RequestVote GetRequestVote(const json& str);
+RequestVote GetRequestVote(const json& j);
 
 struct RequestVoteReply {
   uint64_t term;
@@ -26,7 +26,7 @@ struct RequestVoteReply {
 
 std::string CreateRequestVoteReply(const RequestVoteReply& rvr);
 
-RequestVoteReply GetRequestVoteReply(const json& str);
+RequestVoteReply GetRequestVoteReply(const json& j);
 
 struct AppendEntries {
   uint64_t term;
@@ -38,8 +38,18 @@ struct AppendEntries {
 };
 
 std::string CreateAppendEntries(const AppendEntries& ae);
-AppendEntries GetAppendEntries(const json& str);
 
+AppendEntries GetAppendEntries(const json& j);
+
+
+struct AppendEntriesReply {
+  uint64_t term;
+  bool success;
+};
+
+std::string CreateAppendEntriesReply(const AppendEntriesReply& aer);
+
+AppendEntriesReply GetAppendEntriesReply(const json& j);
 }
 
 #endif // MESSAGE_H
