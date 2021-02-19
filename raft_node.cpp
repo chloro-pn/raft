@@ -12,8 +12,8 @@
 #include <algorithm>
 
 static uint16_t get_server_port_from_config() {
-  uint64_t mid = puck::Config::instance().MyId();
-  const auto& nodes = puck::Config::instance().Nodes();
+  uint64_t mid = raft::Config::instance().MyId();
+  const auto& nodes = raft::Config::instance().Nodes();
   assert(nodes.find(mid) != nodes.end());
 
   const std::string& address = nodes.find(mid)->second;
@@ -25,11 +25,11 @@ static uint16_t get_server_port_from_config() {
 }
 
 static uint64_t get_mid_from_config() {
-  return puck::Config::instance().MyId();
+  return raft::Config::instance().MyId();
 }
 
 static uint64_t get_id_from_iport(const std::string& iport) {
-  const auto& nodes = puck::Config::instance().Nodes();
+  const auto& nodes = raft::Config::instance().Nodes();
   // need c++14 : auto lambda.
   auto it = std::find_if(nodes.begin(), nodes.end(), [&](const auto& iter) -> bool {
     return iter.second == iport;
@@ -41,7 +41,7 @@ static uint64_t get_id_from_iport(const std::string& iport) {
 }
 
 static std::string get_iport_from_id(const uint64_t& id) {
-  const auto& nodes = puck::Config::instance().Nodes();
+  const auto& nodes = raft::Config::instance().Nodes();
   auto it = nodes.find(id);
   if(it == nodes.end()) {
     ERROR("id : ", id, " is not in config");
@@ -50,7 +50,7 @@ static std::string get_iport_from_id(const uint64_t& id) {
 }
 
 static bool all_connected(uint64_t count) {
-  return puck::Config::instance().Nodes().size() == count + 1;
+  return raft::Config::instance().Nodes().size() == count + 1;
 }
 
 // random timeout from 150 to 200 ms.
@@ -72,8 +72,9 @@ RaftNode::RaftNode(asio::io_context& io) : state_(RaftNode::State::Init),
                                            my_id_(get_mid_from_config()),
                                            current_term_(0),
                                            voted_for_(-1),
+                                           commit_index_(0),
+                                           last_applied_(0),
                                            server_(io_, get_server_port_from_config()),
-                                           leader_visited_(false),
                                            voted_count_(0) {
   server_.SetOnConnection([this](std::shared_ptr<puck::TcpConnection> con) -> void {
     INFO("new connection : ", con->Iport());
@@ -96,7 +97,7 @@ RaftNode::RaftNode(asio::io_context& io) : state_(RaftNode::State::Init),
                                                                           puck::util::GetPortFromIport(iport));
     client->SetRetry(5, 3);
     // set callback
-    client->SetOnConnection([=, this](std::shared_ptr<puck::TcpConnection> con) -> void {
+    client->SetOnConnection([i, this](std::shared_ptr<puck::TcpConnection> con) -> void {
       INFO("new connection : ", con->Iport());
       con->SetContext(std::make_shared<uint64_t>(i));
       json j;
@@ -134,7 +135,6 @@ void RaftNode::BecomeFollower(uint64_t new_term_) {
   INFO("node ", my_id_, " become follower from ", GetStateStr());
   state_ = State::Follower;
   current_term_ = new_term_;
-  leader_visited_ = false;
   voted_for_ = -1;
   StartFollowerTimer();
 }
@@ -150,13 +150,8 @@ void RaftNode::StartFollowerTimer() {
       ERROR("asio timer error : ", ec.message());
     }
     assert(state_ == State::Follower);
-    if(leader_visited_ == true) {
-      leader_visited_ = false;
-      StartFollowerTimer();
-    } else {
-      // become candidate and try to run for leader.
-      BecomeCandidate();
-    }
+    // become candidate and try to run for leader.
+    BecomeCandidate();
   }, io_, s);
   timer_handle_ = timer->Start();
 }
@@ -217,7 +212,12 @@ void RaftNode::BecomeLeader() {
   assert(state_ == State::Candidate);
   state_ = State::Leader;
   INFO("node ", my_id_, " become leader.");
-  // TODO ...
+
+  // init next_index_ and match_index_
+  for(auto& each : other_nodes_) {
+    next_index_[each.first] = logs_.GetLastLogIndex() + 1;
+    match_index_[each.first] = 0;
+  }
   StartLeaderTimer();
 }
 
@@ -228,8 +228,15 @@ void RaftNode::StartLeaderTimer() {
   AppendEntries ae;
   ae.term = current_term_;
   ae.leader_id = my_id_;
-  std::string message = CreateAppendEntries(ae);
+  ae.leader_commit = commit_index_;
   for(auto& each : other_nodes_) {
+    // next_index_ always > 0.
+    uint64_t prev_log_index = next_index_[each.first] - 1;
+    ae.prev_log_index = prev_log_index;
+    ae.prev_log_term = logs_.GetTermFromIndex(prev_log_index);
+    ae.entries = logs_.GetLogsAfterPrevLog(ae.prev_log_index);
+
+    std::string message = CreateAppendEntries(ae);
     each.second->Send(message);
   }
   INFO("leader send heartbeat to all followers.");
@@ -316,11 +323,17 @@ void RaftNode::OnMessageFollower(std::shared_ptr<puck::TcpConnection> con) {
   } else if(j["type"].get<std::string>() == "append_entries") {
     // new leader send heartbeat. restart follower timeout.
     AppendEntries ae = GetAppendEntries(j);
+    AppendEntriesReply aer;
+    aer.success = true;
+    aer.term = current_term_;
     if(ae.term >= current_term_) {
       BecomeFollower(ae.term);
+      aer.term = current_term_;
     } else {
-      // 过期，目前不考虑回复
+      aer.success = false;
     }
+    std::string reply_msg = CreateAppendEntriesReply(aer);
+    con->Send(reply_msg);
   } else {
     // 其他消息直接丢掉，因为有可能本节点刚从leader/candidate变成follower
   }
@@ -338,7 +351,7 @@ void RaftNode::OnMessageCandidate(std::shared_ptr<puck::TcpConnection> con) {
       if(rvr.term == current_term_ && rvr.vote_granted == true) {
         ++voted_count_;
         // TODO : 如果收到过半通过票,BecomeLeader.
-        if(voted_count_ * 2 > puck::Config::instance().Nodes().size()) {
+        if(voted_count_ * 2 > raft::Config::instance().Nodes().size()) {
           BecomeLeader();
         }
       }
@@ -390,10 +403,22 @@ void RaftNode::OnMessageLeader(std::shared_ptr<puck::TcpConnection> con) {
   json j = json::parse(message);
   if(j["type"] == "append_entries_reply") {
     AppendEntriesReply aer = GetAppendEntriesReply(j);
+    // current version.
     if(aer.term > current_term_) {
       BecomeFollower(aer.term);
     } else {
-      //本版本只将该信息当作心跳
+      if(aer.success == false) {
+        // TODO : 当前连接对应的id对应的next_index_ 减1.
+        uint64_t id = con->getContext<uint64_t>();
+        next_index_[id] -= 1;
+        // 立即或者等待下一次心跳发送。
+        // 当前版本先将全部同步任务放在心跳，后续要考虑普通心跳和日至复制的分割，这个比较麻烦。
+      } else {
+        // 根据上次发送的entries多少，更新next_index_ 和 match_index_。
+        // 根据match_index_更新commit_index_
+        // 根据commit_index_更新last_applied_
+        // 这里考虑存储上一次发送append_entries的内容。
+      }
     }
   }
 }
@@ -406,6 +431,9 @@ void RaftNode::NodeLeave(std::shared_ptr<puck::TcpConnection> con) {
     INFO("tcp connection state : read_zero");
   } else {
     WARN("tcp connection state : ", con->GetStateStr());
+  }
+  if((other_nodes_.size() + 1) * 2 <= raft::Config::instance().Nodes().size()) {
+    ERROR("too many nodes leave, now : ", other_nodes_.size() + 1, " total : ", raft::Config::instance().Nodes().size());
   }
 }
 }

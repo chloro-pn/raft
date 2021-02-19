@@ -3,12 +3,13 @@
 
 #include <cstdint>
 #include <vector>
+#include <string>
 
 namespace raft {
 // empty item : command_.empty() == true.
 struct Item {
   uint64_t term_;
-  std::vector<uint8_t> command_;
+  std::string command_;
 };
 
 class CommandStorage {
@@ -34,6 +35,19 @@ public:
   uint64_t GetLastLogTerm() const {
     // logs_ never be empty.
     return logs_.back().term_;
+  }
+
+  uint64_t GetTermFromIndex(uint64_t index) const {
+    return logs_.at(index).term_;
+  }
+
+  // 当前版本不考虑一次发送最大logs的限制.
+  std::vector<std::string> GetLogsAfterPrevLog(uint64_t index) const {
+    std::vector<std::string> result;
+    for(uint64_t i = index + 1; i < logs_.size(); ++i) {
+      result.push_back(logs_[i].command_);
+    }
+    return result;
   }
 
 private:

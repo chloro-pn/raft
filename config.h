@@ -4,7 +4,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace puck {
+namespace raft {
 class Config {
 public:
   static Config& instance() {

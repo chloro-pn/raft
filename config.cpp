@@ -7,7 +7,7 @@
 
 using json = nlohmann::json;
 
-namespace puck {
+namespace raft {
 Config::Config() : mid_(0) {
 
 }

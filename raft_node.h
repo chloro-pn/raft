@@ -76,15 +76,20 @@ private:
   uint64_t my_id_;
   std::unordered_map<uint64_t, std::shared_ptr<puck::TcpConnection>> other_nodes_;
 
+  // valid on leader state.
+  std::unordered_map<uint64_t, uint64_t> next_index_;
+  std::unordered_map<uint64_t, uint64_t> match_index_;
+
   uint64_t current_term_;
   // voted_for_ == -1 means not vote in current term.
   int64_t voted_for_;
   CommandStorage logs_;
+  uint64_t commit_index_;
+  uint64_t last_applied_;
 
   puck::Server server_;
   std::vector<std::shared_ptr<puck::Client>> clients_;
 
-  bool leader_visited_;
   // used in candidate state.
   uint64_t voted_count_;
   using timer_type = puck::Timer<asio::chrono::microseconds>;

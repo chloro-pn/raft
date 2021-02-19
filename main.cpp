@@ -42,7 +42,7 @@ int main(int argc, const char* argv[]) {
   if(argc != 2) {
     ERROR("input == config file");
   }
-  puck::Config::instance().Init(argv[1]);
+  raft::Config::instance().Init(argv[1]);
   asio::io_context io;
   //puck::Client client(io, "127.0.0.1", 12345);
   //client.SetRetry(5, 1);
