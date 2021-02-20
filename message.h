@@ -45,6 +45,8 @@ AppendEntries GetAppendEntries(const json& j);
 struct AppendEntriesReply {
   uint64_t term;
   bool success;
+  // 当success == true， 下面这个属性代表了本节点和follower节点一致的下一个节点索引。
+  uint64_t next_index;
 };
 
 std::string CreateAppendEntriesReply(const AppendEntriesReply& aer);

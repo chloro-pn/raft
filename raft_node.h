@@ -67,6 +67,8 @@ public:
 
   void OnMessageLeader(std::shared_ptr<puck::TcpConnection> con);
 
+  void UpdateCommitIndexFromMatchIndex();
+
   void NodeLeave(std::shared_ptr<puck::TcpConnection> con);
 
 private:

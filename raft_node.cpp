@@ -329,8 +329,17 @@ void RaftNode::OnMessageFollower(std::shared_ptr<puck::TcpConnection> con) {
     if(ae.term >= current_term_) {
       BecomeFollower(ae.term);
       aer.term = current_term_;
+      if(logs_.Check(ae.prev_log_index, ae.prev_log_term) == true) {
+        logs_.RewriteOrAppendAfter(ae.prev_log_index, current_term_, ae.entries);
+        aer.next_index = ae.prev_log_index + ae.entries.size() + 1;
+      } else {
+        // 日志不匹配
+        aer.success = false;
+        aer.next_index = 0;
+      }
     } else {
       aer.success = false;
+      aer.next_index = 0;
     }
     std::string reply_msg = CreateAppendEntriesReply(aer);
     con->Send(reply_msg);
@@ -384,14 +393,21 @@ void RaftNode::OnMessageCandidate(std::shared_ptr<puck::TcpConnection> con) {
     AppendEntriesReply aer;
     aer.term = current_term_;
     aer.success = true;
-    if(ae.term > current_term_) {
+    if(ae.term >= current_term_) {
       BecomeFollower(ae.term);
       aer.term = current_term_;
-      // determine aer.success.
-    } else if(ae.term == current_term_) {
-      // determine aer.success.
+      if(logs_.Check(ae.prev_log_index, ae.prev_log_term) == true) {
+        INFO("check true.");
+        logs_.RewriteOrAppendAfter(ae.prev_log_index, current_term_, ae.entries);
+        aer.next_index = ae.prev_log_index + ae.entries.size() + 1;
+      } else {
+        // 日志不匹配
+        aer.success = false;
+        aer.next_index = 0;
+      }
     } else {
       aer.success = false;
+      aer.next_index = 0;
     }
     std::string message = CreateAppendEntriesReply(aer);
     con->Send(message);
@@ -414,12 +430,42 @@ void RaftNode::OnMessageLeader(std::shared_ptr<puck::TcpConnection> con) {
         // 立即或者等待下一次心跳发送。
         // 当前版本先将全部同步任务放在心跳，后续要考虑普通心跳和日至复制的分割，这个比较麻烦。
       } else {
+        uint64_t id = con->getContext<uint64_t>();
+        assert(next_index_[id] <= aer.next_index);
+        next_index_[id] = aer.next_index;
+        match_index_[id] = aer.next_index - 1;
+        UpdateCommitIndexFromMatchIndex();
         // 根据上次发送的entries多少，更新next_index_ 和 match_index_。
         // 根据match_index_更新commit_index_
         // 根据commit_index_更新last_applied_
         // 这里考虑存储上一次发送append_entries的内容。
+        // 或者在append_entries_reply中添加新的字段，表示follower目前的存储进度。
       }
     }
+  }
+}
+
+void RaftNode::UpdateCommitIndexFromMatchIndex() {
+  std::vector<uint64_t> match_indexs;
+  for(const auto& each : match_index_) {
+    match_indexs.push_back(each.second);
+  }
+  std::sort(match_indexs.begin(), match_indexs.end());
+  uint64_t total_size = 1 + match_indexs.size();
+  // if total_size == 5
+  // need 3th index. 5 / 2 + 1 == 3
+  // 3th == array[3 - 1];
+  // else if total_size == 4
+  // need 3th index. 4 / 2 + 1 == 3
+  // 3th == array[3 - 1];
+  uint64_t should_commit = match_indexs[total_size / 2];
+  // 注意， 本term不能直接提交以前term的日志
+  if(current_term_ == logs_.GetTermFromIndex(should_commit)) {
+    assert(commit_index_ >= should_commit);
+    commit_index_ = should_commit;
+    // TODO : update last_applied_ form commit_index_;
+  } else {
+    assert(current_term_ > logs_.GetTermFromIndex(should_commit));
   }
 }
 

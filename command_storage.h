@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 #include <string>
+#include <cassert>
 
 namespace raft {
 // empty item : command_.empty() == true.
@@ -48,6 +49,31 @@ public:
       result.push_back(logs_[i].command_);
     }
     return result;
+  }
+
+  bool Check(uint64_t index, uint64_t term) const {
+    if(logs_.size() <= index) {
+      return false;
+    }
+    if(logs_[index].term_ != term) {
+      return false;
+    }
+    return true;
+  }
+
+  void RewriteOrAppendAfter(uint64_t index, uint64_t current_term, const std::vector<std::string>& logs) {
+    assert(index < logs_.size());
+    uint64_t count = 0;
+    for(uint64_t i = index + 1; i < logs_.size() && count < logs.size(); ++i) {
+      logs_[i].command_ = logs[count];
+      ++count;
+    }
+    for(uint64_t i = count; i < logs.size(); ++i) {
+      Item tmp;
+      tmp.term_ = current_term;
+      tmp.command_ = logs[i];
+      logs_.push_back(tmp);
+    }
   }
 
 private:
