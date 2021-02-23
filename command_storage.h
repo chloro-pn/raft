@@ -42,6 +42,10 @@ public:
     return logs_.at(index).term_;
   }
 
+  const std::string& GetCommandFromIndex(uint64_t index) const {
+    return logs_.at(index).command_;
+  }
+
   // 当前版本不考虑一次发送最大logs的限制.
   std::vector<std::string> GetLogsAfterPrevLog(uint64_t index) const {
     std::vector<std::string> result;
@@ -49,6 +53,10 @@ public:
       result.push_back(logs_[i].command_);
     }
     return result;
+  }
+
+  size_t Size() const {
+    return logs_.size();
   }
 
   bool Check(uint64_t index, uint64_t term) const {

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <vector>
 #include <limits>
+#include <functional>
 #include "asio.hpp"
 #include "log.h"
 #include "asio_wrapper/timer.h"
@@ -43,6 +44,10 @@ public:
 
   explicit RaftNode(asio::io_context& io);
 
+  void SetCallBackFunc(const std::function<void(const std::string&)>& cb) {
+    cb_ = cb;
+  }
+
   void BecomeFollower(uint64_t new_term_);
 
   void StartFollowerTimer();
@@ -57,6 +62,10 @@ public:
 
   void StartLeaderTimer();
 
+  void AppendEntriesToOthers();
+
+  void SendHeartBeat();
+
   void OnMessage(std::shared_ptr<puck::TcpConnection> con);
 
   void OnMessageInit(std::shared_ptr<puck::TcpConnection> con);
@@ -68,6 +77,8 @@ public:
   void OnMessageLeader(std::shared_ptr<puck::TcpConnection> con);
 
   void UpdateCommitIndexFromMatchIndex();
+
+  void ApplyToStateMachine();
 
   void NodeLeave(std::shared_ptr<puck::TcpConnection> con);
 
@@ -88,6 +99,7 @@ private:
   CommandStorage logs_;
   uint64_t commit_index_;
   uint64_t last_applied_;
+  std::function<void(const std::string&)> cb_;
 
   puck::Server server_;
   std::vector<std::shared_ptr<puck::Client>> clients_;

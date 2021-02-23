@@ -218,13 +218,26 @@ void RaftNode::BecomeLeader() {
     next_index_[each.first] = logs_.GetLastLogIndex() + 1;
     match_index_[each.first] = 0;
   }
+  SendHeartBeat();
   StartLeaderTimer();
 }
 
 void RaftNode::StartLeaderTimer() {
+  assert(state_ == State::Leader);
   if(timer_handle_) {
     timer_handle_->Cancel();
   }
+  AppendEntriesToOthers();
+  auto timer = std::make_shared<timer_type>([this](asio::error_code ec) -> void {
+    if(ec) {
+      ERROR("asio timer error : ", ec.message());
+  }
+    StartLeaderTimer();
+  }, io_, get_heartbeat_timeout());
+  timer_handle_ = timer->Start();
+}
+
+void RaftNode::AppendEntriesToOthers() {
   AppendEntries ae;
   ae.term = current_term_;
   ae.leader_id = my_id_;
@@ -239,12 +252,25 @@ void RaftNode::StartLeaderTimer() {
     std::string message = CreateAppendEntries(ae);
     each.second->Send(message);
   }
-  INFO("leader send heartbeat to all followers.");
-  auto timer = std::make_shared<timer_type>([this](asio::error_code ec) -> void {
-    assert(state_ == State::Leader);
-    StartLeaderTimer();
-  }, io_, get_heartbeat_timeout());
-  timer_handle_ = timer->Start();
+  INFO("leader appends entries to all followers.");
+}
+
+void RaftNode::SendHeartBeat() {
+  AppendEntries ae;
+  ae.term = current_term_;
+  ae.leader_id = my_id_;
+  ae.leader_commit = commit_index_;
+  for(auto& each : other_nodes_) {
+    // next_index_ always > 0.
+    uint64_t prev_log_index = next_index_[each.first] - 1;
+    ae.prev_log_index = prev_log_index;
+    ae.prev_log_term = logs_.GetTermFromIndex(prev_log_index);
+    ae.entries.clear(); // heart beat.
+
+    std::string message = CreateAppendEntries(ae);
+    each.second->Send(message);
+  }
+  INFO("leader sends heartbeat to other.");
 }
 
 void RaftNode::OnMessage(std::shared_ptr<puck::TcpConnection> con) {
@@ -332,6 +358,10 @@ void RaftNode::OnMessageFollower(std::shared_ptr<puck::TcpConnection> con) {
       if(logs_.Check(ae.prev_log_index, ae.prev_log_term) == true) {
         logs_.RewriteOrAppendAfter(ae.prev_log_index, current_term_, ae.entries);
         aer.next_index = ae.prev_log_index + ae.entries.size() + 1;
+        if(ae.leader_commit > commit_index_) {
+          commit_index_ = std::min(static_cast<uint64_t>(logs_.Size() - 1), ae.leader_commit);
+        }
+        ApplyToStateMachine();
       } else {
         // 日志不匹配
         aer.success = false;
@@ -463,9 +493,19 @@ void RaftNode::UpdateCommitIndexFromMatchIndex() {
   if(current_term_ == logs_.GetTermFromIndex(should_commit)) {
     assert(commit_index_ >= should_commit);
     commit_index_ = should_commit;
-    // TODO : update last_applied_ form commit_index_;
+    // Done : update last_applied_ form commit_index_;
+    ApplyToStateMachine();
   } else {
     assert(current_term_ > logs_.GetTermFromIndex(should_commit));
+  }
+}
+
+void RaftNode::ApplyToStateMachine() {
+  while(last_applied_ < commit_index_) {
+    if(cb_) {
+      ++last_applied_;
+      cb_(logs_.GetCommandFromIndex(last_applied_));
+    }
   }
 }
 
