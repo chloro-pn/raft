@@ -14,6 +14,7 @@
 #include "asio_wrapper/server.h"
 #include "asio_wrapper/client.h"
 #include "command_storage.h"
+#include "message.h"
 
 namespace raft {
 class RaftNodeContext {
@@ -48,7 +49,7 @@ public:
     cb_ = cb;
   }
 
-  void BecomeFollower(uint64_t new_term_);
+  void BecomeFollower(uint64_t new_term_, int64_t new_leader_);
 
   void StartFollowerTimer();
 
@@ -68,13 +69,18 @@ public:
 
   void OnMessage(std::shared_ptr<puck::TcpConnection> con);
 
-  void OnMessageInit(std::shared_ptr<puck::TcpConnection> con);
+  void OnMessageInit(std::shared_ptr<puck::TcpConnection> con, const json& j);
 
-  void OnMessageFollower(std::shared_ptr<puck::TcpConnection> con);
+  void OnMessageFollower(std::shared_ptr<puck::TcpConnection> con, const json& j);
 
-  void OnMessageCandidate(std::shared_ptr<puck::TcpConnection> con);
+  void OnMessageCandidate(std::shared_ptr<puck::TcpConnection> con, const json& j);
 
-  void OnMessageLeader(std::shared_ptr<puck::TcpConnection> con);
+  // Follower 和 Candidate具有相同的处理逻辑
+  AppendEntriesReply HandleAppendEntries(const AppendEntries& ae);
+
+  RequestVoteReply HandleRequestVote(const RequestVote& rv);
+
+  void OnMessageLeader(std::shared_ptr<puck::TcpConnection> con, const json& j);
 
   void UpdateCommitIndexFromMatchIndex();
 
@@ -96,6 +102,8 @@ private:
   uint64_t current_term_;
   // voted_for_ == -1 means not vote in current term.
   int64_t voted_for_;
+  // 当不知道当前leader是谁时，leader_id_ == -1.
+  int64_t leader_id_;
   CommandStorage logs_;
   uint64_t commit_index_;
   uint64_t last_applied_;

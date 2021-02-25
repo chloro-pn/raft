@@ -52,6 +52,34 @@ struct AppendEntriesReply {
 std::string CreateAppendEntriesReply(const AppendEntriesReply& aer);
 
 AppendEntriesReply GetAppendEntriesReply(const json& j);
+
+struct Propose {
+  uint64_t id;
+  std::string command;
+};
+
+std::string CreatePropose(const Propose& p);
+
+Propose GetPropose(const json& j);
+
+struct ProposeReply {
+  uint64_t id;
+};
+
+std::string CreateProposeReply(const ProposeReply& p);
+
+ProposeReply GetProposeReply(const json& j);
+
+struct Ddos {
+  // 如果不知道当前leader，leader_id_ == -1.
+  int64_t leader_id;
+  std::string ip;
+  uint16_t port;
+};
+
+std::string CreateDdos(const Ddos& p);
+
+Ddos GetDdos(const json& j);
 }
 
 #endif // MESSAGE_H

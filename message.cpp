@@ -84,4 +84,49 @@ AppendEntriesReply GetAppendEntriesReply(const json& j) {
   aer.next_index = j["next_index"].get<uint64_t>();
   return aer;
 }
+
+std::string CreatePropose(const Propose& p) {
+  json j;
+  j["type"] = "propose";
+  j["id"] = p.id;
+  j["command"] = p.command;
+  return j.dump();
+}
+
+Propose GetPropose(const json& j) {
+  Propose p;
+  p.id = j["index"].get<uint64_t>();
+  p.command = j["command"].get<std::string>();
+  return p;
+}
+
+std::string CreateProposeReply(const ProposeReply& p) {
+  json j;
+  j["type"] = "propose_reply";
+  j["index"] = p.id;
+  return j.dump();
+}
+
+ProposeReply GetProposeReply(const json& j) {
+  ProposeReply pr;
+  pr.id = j["index"].get<uint64_t>();
+  return pr;
+}
+
+std::string CreateDdos(const Ddos& p) {
+  json j;
+  j["type"] = "ddos";
+  j["leader_id"] = p.leader_id;
+  j["ip"] = p.ip;
+  j["port"] = p.port;
+  return j.dump();
+}
+
+Ddos GetDdos(const json& j) {
+  Ddos d;
+  d.leader_id = j["leader_id"].get<int64_t>();
+  d.ip = j["ip"].get<std::string>();
+  d.port = j["port"].get<uint16_t>();
+  return d;
+}
 }

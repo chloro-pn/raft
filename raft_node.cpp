@@ -28,18 +28,6 @@ static uint64_t get_mid_from_config() {
   return raft::Config::instance().MyId();
 }
 
-static uint64_t get_id_from_iport(const std::string& iport) {
-  const auto& nodes = raft::Config::instance().Nodes();
-  // need c++14 : auto lambda.
-  auto it = std::find_if(nodes.begin(), nodes.end(), [&](const auto& iter) -> bool {
-    return iter.second == iport;
-  });
-  if(it == nodes.end()) {
-    ERROR("new connection's iport ", iport, "is not in config.");
-  }
-  return it->first;
-}
-
 static std::string get_iport_from_id(const uint64_t& id) {
   const auto& nodes = raft::Config::instance().Nodes();
   auto it = nodes.find(id);
@@ -54,16 +42,16 @@ static bool all_connected(uint64_t count) {
 }
 
 // random timeout from 150 to 200 ms.
-static asio::chrono::microseconds get_random_election_timeout() {
-  return asio::chrono::microseconds(puck::util::GetRandomFromTo(150, 200));
+static asio::chrono::milliseconds get_random_election_timeout() {
+  return asio::chrono::milliseconds(puck::util::GetRandomFromTo(150, 150));
 }
 
-static asio::chrono::microseconds get_candidate_timeout() {
-  return asio::chrono::microseconds(800);
+static asio::chrono::milliseconds get_candidate_timeout() {
+  return asio::chrono::milliseconds(400);
 }
 
 static asio::chrono::seconds get_heartbeat_timeout() {
-  return asio::chrono::seconds(3);
+  return asio::chrono::seconds(2);
 }
 
 namespace raft {
@@ -72,6 +60,7 @@ RaftNode::RaftNode(asio::io_context& io) : state_(RaftNode::State::Init),
                                            my_id_(get_mid_from_config()),
                                            current_term_(0),
                                            voted_for_(-1),
+                                           leader_id_(-1),
                                            commit_index_(0),
                                            last_applied_(0),
                                            server_(io_, get_server_port_from_config()),
@@ -111,7 +100,7 @@ RaftNode::RaftNode(asio::io_context& io) : state_(RaftNode::State::Init),
       assert(state_ == State::Init);
       if(all_connected(other_nodes_.size())) {
         INFO("node ", my_id_, " start.");
-        BecomeFollower(0);
+        BecomeFollower(0, -1);
       }
     });
 
@@ -131,11 +120,15 @@ RaftNode::RaftNode(asio::io_context& io) : state_(RaftNode::State::Init),
   }
 }
 
-void RaftNode::BecomeFollower(uint64_t new_term_) {
+// BUG FIX
+void RaftNode::BecomeFollower(uint64_t new_term_, int64_t new_leader_) {
   INFO("node ", my_id_, " become follower from ", GetStateStr());
   state_ = State::Follower;
-  current_term_ = new_term_;
-  voted_for_ = -1;
+  if(new_term_ > current_term_) {
+    current_term_ = new_term_;
+    voted_for_ = -1;
+    leader_id_ = new_leader_;
+  }
   StartFollowerTimer();
 }
 
@@ -144,7 +137,7 @@ void RaftNode::StartFollowerTimer() {
   if(timer_handle_) {
     timer_handle_->Cancel();
   }
-  asio::chrono::seconds s = asio::chrono::seconds(5);
+  asio::chrono::seconds s = asio::chrono::seconds(2);
   std::shared_ptr<timer_type> timer = std::make_shared<timer_type>([this](const asio::error_code& ec) -> void {
     if(ec) {
       ERROR("asio timer error : ", ec.message());
@@ -159,10 +152,12 @@ void RaftNode::StartFollowerTimer() {
 void RaftNode::BecomeCandidate() {
   // 只能从 follower 或者 candidate 变成 candidate 状态
   assert(state_ == State::Follower || state_ == State::Candidate);
+  // 立刻将知道的leader_id_修改为-1，防止超时时间到来前有客户端连接。
+  leader_id_ = -1;
   if(timer_handle_) {
     timer_handle_->Cancel();
   }
-  asio::chrono::microseconds ms = get_random_election_timeout();
+  asio::chrono::milliseconds ms = get_random_election_timeout();
   std::shared_ptr<timer_type> timer = std::make_shared<timer_type>([this](const asio::error_code& ec) -> void {
     if(ec) {
       ERROR("asio timer error : ", ec.message());
@@ -195,7 +190,7 @@ void RaftNode::RunForLeader() {
   if(timer_handle_) {
     timer_handle_->Cancel();
   }
-  asio::chrono::microseconds ms = get_candidate_timeout();
+  asio::chrono::milliseconds ms = get_candidate_timeout();
   std::shared_ptr<timer_type> timer = std::make_shared<timer_type>([this](const asio::error_code& ec) -> void {
     if(ec) {
       ERROR("asio timer error : ", ec.message());
@@ -211,7 +206,8 @@ void RaftNode::RunForLeader() {
 void RaftNode::BecomeLeader() {
   assert(state_ == State::Candidate);
   state_ = State::Leader;
-  INFO("node ", my_id_, " become leader.");
+  leader_id_ = my_id_;
+  INFO("node ", my_id_, " become leader, term : ", current_term_);
 
   // init next_index_ and match_index_
   for(auto& each : other_nodes_) {
@@ -238,6 +234,7 @@ void RaftNode::StartLeaderTimer() {
 }
 
 void RaftNode::AppendEntriesToOthers() {
+  assert(static_cast<int64_t>(my_id_) == leader_id_);
   AppendEntries ae;
   ae.term = current_term_;
   ae.leader_id = my_id_;
@@ -256,6 +253,7 @@ void RaftNode::AppendEntriesToOthers() {
 }
 
 void RaftNode::SendHeartBeat() {
+  assert(static_cast<int64_t>(my_id_) == leader_id_);
   AppendEntries ae;
   ae.term = current_term_;
   ae.leader_id = my_id_;
@@ -273,28 +271,47 @@ void RaftNode::SendHeartBeat() {
   INFO("leader sends heartbeat to other.");
 }
 
+using json = nlohmann::json;
+
 void RaftNode::OnMessage(std::shared_ptr<puck::TcpConnection> con) {
+  std::string message(con->MessageData(), con->MessageLength());
+  json j = json::parse(message);
+  if(j["type"].get<std::string>() == "propose") {
+    if(state_ == State::Leader) {
+      OnMessageLeader(con, j);
+    } else {
+      Ddos d;
+      d.leader_id = leader_id_;
+      if(leader_id_ != -1) {
+        std::string iport = get_iport_from_id(leader_id_);
+        d.ip = puck::util::GetIpFromIport(iport);
+        d.port = puck::util::GetPortFromIport(iport);
+      } else {
+        d.ip = "";
+        d.port = 0;
+      }
+      con->Send(CreateDdos(d));
+      con->ShutdownW();
+    }
+    return;
+  }
   if(state_ == State::Init) {
-    OnMessageInit(con);
+    OnMessageInit(con, j);
   } else if(state_ == State::Follower) {
-    OnMessageFollower(con);
+    OnMessageFollower(con, j);
   } else if(state_ == State::Candidate) {
-    OnMessageCandidate(con);
+    OnMessageCandidate(con, j);
   } else if(state_ == State::Leader) {
-    OnMessageLeader(con);
+    OnMessageLeader(con, j);
   } else {
     ERROR("get message from unknow state.");
   }
 }
 
-using json = nlohmann::json;
-
 // only server node.
-void RaftNode::OnMessageInit(std::shared_ptr<puck::TcpConnection> con) {
+void RaftNode::OnMessageInit(std::shared_ptr<puck::TcpConnection> con, const json& j) {
   int64_t id = con->getContext<int64_t>();
   assert(id == -1);
-  std::string message(con->MessageData(), con->MessageLength());
-  json j = json::parse(message);
   if(j["type"].get<std::string>() != "init") {
     ERROR("node ", my_id_, " get error type message :", j["type"].get<std::string>(), "on state init.");
   }
@@ -308,83 +325,39 @@ void RaftNode::OnMessageInit(std::shared_ptr<puck::TcpConnection> con) {
   assert(state_ == State::Init);
   if(all_connected(other_nodes_.size())) {
     INFO("node ", my_id_, " start.");
-    BecomeFollower(0);
+    BecomeFollower(0, -1);
   }
 }
 
-void RaftNode::OnMessageFollower(std::shared_ptr<puck::TcpConnection> con) {
-  std::string message(con->MessageData(), con->MessageLength());
-  json j = json::parse(message);
+void RaftNode::OnMessageFollower(std::shared_ptr<puck::TcpConnection> con, const json& j) {
   if(j["type"].get<std::string>() == "request_vote") {
     RequestVote rv = GetRequestVote(j);
-
-    RequestVoteReply rvr;
-    rvr.term = current_term_;
-    rvr.vote_granted = false;
-
-    if(rv.term > current_term_) {
-      BecomeFollower(rv.term);
-      rvr.term = current_term_;
-      if(rv.last_log_term > logs_.GetLastLogTerm() ||
-         (rv.last_log_term == logs_.GetLastLogTerm() && rv.last_log_index >= logs_.GetLastLogIndex())) {
-        rvr.vote_granted = true;
-        voted_for_ = rv.candidate_id;
-      } else {
-        assert(voted_for_ == -1);
-      }
-    } else if(rv.term == current_term_ && voted_for_ == -1) {
-      if(rv.last_log_term > logs_.GetLastLogTerm() ||
-         (rv.last_log_term == logs_.GetLastLogTerm() && rv.last_log_index >= logs_.GetLastLogIndex())) {
-        rvr.vote_granted = true;
-        voted_for_ = rv.candidate_id;
-      } else {
-        assert(voted_for_ == -1);
-      }
-    } else {
-      // 要么是过时消息，要么是本term已经投过票了
-    }
-
+    RequestVoteReply rvr = HandleRequestVote(rv);
     std::string reply_msg = CreateRequestVoteReply(rvr);
     con->Send(reply_msg);
   } else if(j["type"].get<std::string>() == "append_entries") {
-    // new leader send heartbeat. restart follower timeout.
     AppendEntries ae = GetAppendEntries(j);
-    AppendEntriesReply aer;
-    aer.success = true;
-    aer.term = current_term_;
-    if(ae.term >= current_term_) {
-      BecomeFollower(ae.term);
-      aer.term = current_term_;
-      if(logs_.Check(ae.prev_log_index, ae.prev_log_term) == true) {
-        logs_.RewriteOrAppendAfter(ae.prev_log_index, current_term_, ae.entries);
-        aer.next_index = ae.prev_log_index + ae.entries.size() + 1;
-        if(ae.leader_commit > commit_index_) {
-          commit_index_ = std::min(static_cast<uint64_t>(logs_.Size() - 1), ae.leader_commit);
-        }
-        ApplyToStateMachine();
-      } else {
-        // 日志不匹配
-        aer.success = false;
-        aer.next_index = 0;
-      }
-    } else {
-      aer.success = false;
-      aer.next_index = 0;
-    }
+    auto aer = HandleAppendEntries(ae);
     std::string reply_msg = CreateAppendEntriesReply(aer);
     con->Send(reply_msg);
   } else {
-    // 其他消息直接丢掉，因为有可能本节点刚从leader/candidate变成follower
+    // 有可能本节点刚从leader/candidate变成follower，只需要判断term即可
+    std::string type = j["type"].get<std::string>();
+    if(type != "request_vote_reply" && type != "append_entries_reply") {
+      ERROR("error message type : ", type, " on state follower.");
+    }
+    uint64_t term = j["term"].get<uint64_t>();
+    if(term > current_term_) {
+      BecomeFollower(term, -1);
+    }
   }
 }
 
-void RaftNode::OnMessageCandidate(std::shared_ptr<puck::TcpConnection> con) {
-  std::string message(con->MessageData(), con->MessageLength());
-  json j = json::parse(message);
+void RaftNode::OnMessageCandidate(std::shared_ptr<puck::TcpConnection> con, const json& j) {
   if(j["type"].get<std::string>() == "request_vote_reply") {
     RequestVoteReply rvr = GetRequestVoteReply(j);
     if(rvr.term > current_term_) {
-      BecomeFollower(rvr.term);
+      BecomeFollower(rvr.term, -1);
     } else {
       // 只接受本term的投票
       if(rvr.term == current_term_ && rvr.vote_granted == true) {
@@ -397,61 +370,83 @@ void RaftNode::OnMessageCandidate(std::shared_ptr<puck::TcpConnection> con) {
     }
   } else if(j["type"].get<std::string>() == "request_vote") {
     RequestVote rv = GetRequestVote(j);
-    RequestVoteReply rvr;
-    rvr.term = current_term_;
-    rvr.vote_granted = false;
-
-    if(rv.term > current_term_) {
-      BecomeFollower(rv.term);
-      rvr.term = current_term_;
-      if(rv.last_log_term > logs_.GetLastLogTerm() ||
-         (rv.last_log_term == logs_.GetLastLogTerm() && rv.last_log_index >= logs_.GetLastLogIndex())) {
-        rvr.vote_granted = true;
-        voted_for_ = rv.candidate_id;
-      } else {
-        assert(voted_for_ == -1);
-      }
-    } else {
-      // 由于是candidate状态，因此voted_for_ == my_id_, 已经把票投给了自己。
-      assert(voted_for_ == my_id_);
-    }
-
+    RequestVoteReply rvr = HandleRequestVote(rv);
     std::string reply_msg = CreateRequestVoteReply(rvr);
     con->Send(reply_msg);
   } else if(j["type"].get<std::string>() == "append_entries") {
     AppendEntries ae = GetAppendEntries(j);
-    AppendEntriesReply aer;
-    aer.term = current_term_;
-    aer.success = true;
-    if(ae.term >= current_term_) {
-      BecomeFollower(ae.term);
-      aer.term = current_term_;
-      if(logs_.Check(ae.prev_log_index, ae.prev_log_term) == true) {
-        INFO("check true.");
-        logs_.RewriteOrAppendAfter(ae.prev_log_index, current_term_, ae.entries);
-        aer.next_index = ae.prev_log_index + ae.entries.size() + 1;
-      } else {
-        // 日志不匹配
-        aer.success = false;
-        aer.next_index = 0;
-      }
-    } else {
-      aer.success = false;
-      aer.next_index = 0;
-    }
+    AppendEntriesReply aer = HandleAppendEntries(ae);
     std::string message = CreateAppendEntriesReply(aer);
     con->Send(message);
+  } else {
+    std::string type = j["type"].get<std::string>();
+    if(type != "append_entries_reply") {
+      ERROR("error message type : ", type, " on state candidate.");
+    }
+    uint64_t term = j["term"].get<uint64_t>();
+    if(term > current_term_) {
+      BecomeFollower(term, -1);
+    }
   }
 }
 
-void RaftNode::OnMessageLeader(std::shared_ptr<puck::TcpConnection> con) {
-  std::string message(con->MessageData(), con->MessageLength());
-  json j = json::parse(message);
-  if(j["type"] == "append_entries_reply") {
+AppendEntriesReply RaftNode::HandleAppendEntries(const AppendEntries& ae) {
+  AppendEntriesReply aer;
+  aer.success = true;
+  aer.term = current_term_;
+  if(ae.term >= current_term_) {
+    BecomeFollower(ae.term, ae.leader_id);
+    aer.term = current_term_;
+    if(logs_.Check(ae.prev_log_index, ae.prev_log_term) == true) {
+      logs_.RewriteOrAppendAfter(ae.prev_log_index, current_term_, ae.entries);
+      aer.next_index = ae.prev_log_index + ae.entries.size() + 1;
+      if(ae.leader_commit > commit_index_) {
+        commit_index_ = std::min(static_cast<uint64_t>(logs_.Size() - 1), ae.leader_commit);
+      }
+      ApplyToStateMachine();
+    } else {
+      // 日志不匹配
+      aer.success = false;
+      aer.next_index = 0;
+    }
+  } else {
+    aer.success = false;
+    aer.next_index = 0;
+  }
+  return aer;
+}
+
+RequestVoteReply RaftNode::HandleRequestVote(const RequestVote& rv) {
+  RequestVoteReply rvr;
+  rvr.term = current_term_;
+  rvr.vote_granted = false;
+
+  if(rv.term > current_term_) {
+    BecomeFollower(rv.term, -1);
+    rvr.term = current_term_;
+  }
+
+  if(rv.term == current_term_ && voted_for_ == -1) {
+    if(logs_.MoreOrEqualUpToDate(rv.last_log_index, rv.last_log_term)) {
+      rvr.vote_granted = true;
+      voted_for_ = rv.candidate_id;
+      INFO("node ", my_id_, " vote for node ", rv.candidate_id, " in term ", rv.term);
+    }
+  }
+  return rvr;
+}
+
+void RaftNode::OnMessageLeader(std::shared_ptr<puck::TcpConnection> con, const json& j) {
+  if(j["type"].get<std::string>() == "propose") {
+    Propose p = GetPropose(j);
+    // TODO : 加入本地日志，并广播给其他节点，同时存储p到对应的index上
+    // 在p对应的index上的log被commited后，给客户端恢复proposeReply信息
+  }
+  if(j["type"].get<std::string>() == "append_entries_reply") {
     AppendEntriesReply aer = GetAppendEntriesReply(j);
     // current version.
     if(aer.term > current_term_) {
-      BecomeFollower(aer.term);
+      BecomeFollower(aer.term, -1);
     } else {
       if(aer.success == false) {
         // TODO : 当前连接对应的id对应的next_index_ 减1.
@@ -460,17 +455,47 @@ void RaftNode::OnMessageLeader(std::shared_ptr<puck::TcpConnection> con) {
         // 立即或者等待下一次心跳发送。
         // 当前版本先将全部同步任务放在心跳，后续要考虑普通心跳和日至复制的分割，这个比较麻烦。
       } else {
+        // 根据上次发送的entries多少，更新next_index_ 和 match_index_。
+        // 根据match_index_更新commit_index_
+        // 根据commit_index_更新last_applied_
+        // 在append_entries_reply中添加新的字段，表示follower目前的存储进度。
         uint64_t id = con->getContext<uint64_t>();
         assert(next_index_[id] <= aer.next_index);
         next_index_[id] = aer.next_index;
         match_index_[id] = aer.next_index - 1;
         UpdateCommitIndexFromMatchIndex();
-        // 根据上次发送的entries多少，更新next_index_ 和 match_index_。
-        // 根据match_index_更新commit_index_
-        // 根据commit_index_更新last_applied_
-        // 这里考虑存储上一次发送append_entries的内容。
-        // 或者在append_entries_reply中添加新的字段，表示follower目前的存储进度。
       }
+    }
+  } else if(j["type"].get<std::string>() == "request_vote_reply") {
+    RequestVoteReply rev = GetRequestVoteReply(j);
+    if(rev.term <= current_term_) {
+      //忽略即可
+    } else {
+      BecomeFollower(rev.term, -1);
+    }
+  }
+  else {
+    // 正常情况下leader只会收到append entries reply信息、request vote reply信息和客户端的读写信息
+    // 可能由于网络分区，抖动等问题收到其他信息。
+    if(j["type"].get<std::string>() == "append_entries") {
+      // 在进入常规的处理函数前，判断term不能相等
+      uint64_t term = j["term"].get<uint64_t>();
+      if(term == current_term_) {
+        // 即使是网络分区，raft也不可能出现两个leader拥有相同的term，严重错误。
+        ERROR("internal error : two leaders have the same term : ", term);
+      }
+      auto aer = HandleAppendEntries(GetAppendEntries(j));
+      con->Send(CreateAppendEntriesReply(aer));
+    } else if(j["type"].get<std::string>() == "request_vote") {
+      // candidate变成leader，也不能修改voted_for_
+      // 因为可能在leader状态可能会受到请求投票信息
+      // 例如某个candidate获得过半票并变身成为leader，在通知其他节点之前
+      // 某个节点follower超时并发送了request vote信息给leader
+      assert(voted_for_ == static_cast<int64_t>(my_id_));
+      auto rvr = HandleRequestVote(GetRequestVote(j));
+      con->Send(CreateRequestVoteReply(rvr));
+    } else {
+      ERROR("error message type : ", j["type"].get<std::string>(), " on state leader.");
     }
   }
 }

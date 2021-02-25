@@ -59,6 +59,15 @@ public:
     return logs_.size();
   }
 
+  bool MoreOrEqualUpToDate(uint64_t index, uint64_t term) const {
+    if(term > GetLastLogTerm()) {
+      return true;
+    } else if(term == GetLastLogTerm() && index >= GetLastLogIndex()) {
+      return true;
+    }
+    return false;
+  }
+
   bool Check(uint64_t index, uint64_t term) const {
     if(logs_.size() <= index) {
       return false;
