@@ -10,6 +10,7 @@
 #include <string>
 #include <cstdlib>
 #include <algorithm>
+#include <limits>
 
 static uint16_t get_server_port_from_config() {
   uint64_t mid = raft::Config::instance().MyId();
@@ -54,6 +55,8 @@ static asio::chrono::seconds get_heartbeat_timeout() {
   return asio::chrono::seconds(2);
 }
 
+static uint64_t CLIENT_CONTEXT = std::numeric_limits<uint64_t>::max();
+
 namespace raft {
 RaftNode::RaftNode(asio::io_context& io) : state_(RaftNode::State::Init),
                                            io_(io),
@@ -75,7 +78,12 @@ RaftNode::RaftNode(asio::io_context& io) : state_(RaftNode::State::Init),
   });
 
   server_.SetOnClose([this](std::shared_ptr<puck::TcpConnection> con) -> void {
-    this->NodeLeave(con);
+    uint64_t id = con->getContext<uint64_t>();
+    if(id == CLIENT_CONTEXT) {
+      this->ClientLeave(con);
+    } else {
+      this->NodeLeave(con);
+    }
   });
 
   // 开启client，连接id比自己小的服务器
@@ -123,6 +131,10 @@ RaftNode::RaftNode(asio::io_context& io) : state_(RaftNode::State::Init),
 // BUG FIX
 void RaftNode::BecomeFollower(uint64_t new_term_, int64_t new_leader_) {
   INFO("node ", my_id_, " become follower from ", GetStateStr());
+  if(state_ == State::Leader) {
+    // 从leader变成follower，及时向客户端回复ddos
+    DdosAllClient();
+  }
   state_ = State::Follower;
   if(new_term_ > current_term_) {
     current_term_ = new_term_;
@@ -239,6 +251,7 @@ void RaftNode::AppendEntriesToOthers() {
   ae.term = current_term_;
   ae.leader_id = my_id_;
   ae.leader_commit = commit_index_;
+  ae.heart_beat = false;
   for(auto& each : other_nodes_) {
     // next_index_ always > 0.
     uint64_t prev_log_index = next_index_[each.first] - 1;
@@ -258,12 +271,13 @@ void RaftNode::SendHeartBeat() {
   ae.term = current_term_;
   ae.leader_id = my_id_;
   ae.leader_commit = commit_index_;
+  ae.heart_beat = true;
   for(auto& each : other_nodes_) {
     // next_index_ always > 0.
     uint64_t prev_log_index = next_index_[each.first] - 1;
     ae.prev_log_index = prev_log_index;
     ae.prev_log_term = logs_.GetTermFromIndex(prev_log_index);
-    ae.entries.clear(); // heart beat.
+    ae.entries.clear();
 
     std::string message = CreateAppendEntries(ae);
     each.second->Send(message);
@@ -273,6 +287,33 @@ void RaftNode::SendHeartBeat() {
 
 using json = nlohmann::json;
 
+void RaftNode::DdosToClient(std::shared_ptr<puck::TcpConnection> con) {
+  Ddos d;
+  d.leader_id = leader_id_;
+  if(leader_id_ != -1) {
+    std::string iport = get_iport_from_id(leader_id_);
+    d.ip = puck::util::GetIpFromIport(iport);
+    d.port = puck::util::GetPortFromIport(iport);
+  } else {
+    d.ip = "";
+    d.port = 0;
+  }
+  con->Send(CreateDdos(d));
+  con->ShutdownW();
+}
+
+void RaftNode::DdosAllClient() {
+  Ddos d;
+  d.leader_id = -1;
+  d.ip = "";
+  d.port = 0;
+  std::string message = CreateDdos(d);
+  for(auto& each : real_clients_) {
+    each.second.client->Send(message);
+  }
+  real_clients_.clear();
+}
+
 void RaftNode::OnMessage(std::shared_ptr<puck::TcpConnection> con) {
   std::string message(con->MessageData(), con->MessageLength());
   json j = json::parse(message);
@@ -280,18 +321,7 @@ void RaftNode::OnMessage(std::shared_ptr<puck::TcpConnection> con) {
     if(state_ == State::Leader) {
       OnMessageLeader(con, j);
     } else {
-      Ddos d;
-      d.leader_id = leader_id_;
-      if(leader_id_ != -1) {
-        std::string iport = get_iport_from_id(leader_id_);
-        d.ip = puck::util::GetIpFromIport(iport);
-        d.port = puck::util::GetPortFromIport(iport);
-      } else {
-        d.ip = "";
-        d.port = 0;
-      }
-      con->Send(CreateDdos(d));
-      con->ShutdownW();
+      DdosToClient(con);
     }
     return;
   }
@@ -394,9 +424,16 @@ AppendEntriesReply RaftNode::HandleAppendEntries(const AppendEntries& ae) {
   AppendEntriesReply aer;
   aer.success = true;
   aer.term = current_term_;
+  aer.heart_beat = false;
   if(ae.term >= current_term_) {
     BecomeFollower(ae.term, ae.leader_id);
     aer.term = current_term_;
+    // 如果是心跳包，只考虑term就行了
+    if(ae.heart_beat == true) {
+      aer.heart_beat = true;
+      aer.next_index = 0;
+      return aer;
+    }
     if(logs_.Check(ae.prev_log_index, ae.prev_log_term) == true) {
       logs_.RewriteOrAppendAfter(ae.prev_log_index, current_term_, ae.entries);
       aer.next_index = ae.prev_log_index + ae.entries.size() + 1;
@@ -439,15 +476,19 @@ RequestVoteReply RaftNode::HandleRequestVote(const RequestVote& rv) {
 void RaftNode::OnMessageLeader(std::shared_ptr<puck::TcpConnection> con, const json& j) {
   if(j["type"].get<std::string>() == "propose") {
     Propose p = GetPropose(j);
-    // TODO : 加入本地日志，并广播给其他节点，同时存储p到对应的index上
-    // 在p对应的index上的log被commited后，给客户端恢复proposeReply信息
-  }
-  if(j["type"].get<std::string>() == "append_entries_reply") {
+    Item tmp {current_term_, p.command};
+    logs_.Storage(tmp);
+    real_clients_[logs_.GetLastLogIndex()] = ClientContext{p.id, con};
+    con->SetContext(std::make_shared<uint64_t>(CLIENT_CONTEXT));
+  } else if(j["type"].get<std::string>() == "append_entries_reply") {
     AppendEntriesReply aer = GetAppendEntriesReply(j);
     // current version.
     if(aer.term > current_term_) {
       BecomeFollower(aer.term, -1);
     } else {
+      if(aer.heart_beat == true) {
+        return;
+      }
       if(aer.success == false) {
         // TODO : 当前连接对应的id对应的next_index_ 减1.
         uint64_t id = con->getContext<uint64_t>();
@@ -525,11 +566,18 @@ void RaftNode::UpdateCommitIndexFromMatchIndex() {
   }
 }
 
+// fix stupid error.
 void RaftNode::ApplyToStateMachine() {
   while(last_applied_ < commit_index_) {
+    ++last_applied_;
     if(cb_) {
-      ++last_applied_;
       cb_(logs_.GetCommandFromIndex(last_applied_));
+      if(real_clients_.find(last_applied_) != real_clients_.end()) {
+        auto id = real_clients_[last_applied_].id;
+        auto client = real_clients_[last_applied_].client;
+        client->Send(CreateProposeReply(ProposeReply{id}));
+        real_clients_.erase(last_applied_);
+      }
     }
   }
 }
@@ -545,6 +593,15 @@ void RaftNode::NodeLeave(std::shared_ptr<puck::TcpConnection> con) {
   }
   if((other_nodes_.size() + 1) * 2 <= raft::Config::instance().Nodes().size()) {
     ERROR("too many nodes leave, now : ", other_nodes_.size() + 1, " total : ", raft::Config::instance().Nodes().size());
+  }
+}
+
+void RaftNode::ClientLeave(std::shared_ptr<puck::TcpConnection> con) {
+  INFO("client connection close");
+  if(con->GetState() == puck::TcpConnection::ConnState::ReadZero) {
+    INFO("tcp connection state : read_zero");
+  } else {
+    WARN("tcp connection state : ", con->GetStateStr());
   }
 }
 }

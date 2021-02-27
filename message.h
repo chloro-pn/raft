@@ -35,6 +35,7 @@ struct AppendEntries {
   uint64_t prev_log_term;
   std::vector<std::string> entries;
   uint64_t leader_commit;
+  bool heart_beat;
 };
 
 std::string CreateAppendEntries(const AppendEntries& ae);
@@ -47,6 +48,7 @@ struct AppendEntriesReply {
   bool success;
   // 当success == true， 下面这个属性代表了本节点和follower节点一致的下一个节点索引。
   uint64_t next_index;
+  bool heart_beat;
 };
 
 std::string CreateAppendEntriesReply(const AppendEntriesReply& aer);
@@ -64,6 +66,10 @@ Propose GetPropose(const json& j);
 
 struct ProposeReply {
   uint64_t id;
+
+  explicit ProposeReply(uint64_t id) : id(id) {
+
+  }
 };
 
 std::string CreateProposeReply(const ProposeReply& p);

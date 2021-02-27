@@ -69,13 +69,16 @@ public:
 
   void OnMessage(std::shared_ptr<puck::TcpConnection> con);
 
+  void DdosToClient(std::shared_ptr<puck::TcpConnection> con);
+
+  void DdosAllClient();
+
   void OnMessageInit(std::shared_ptr<puck::TcpConnection> con, const json& j);
 
   void OnMessageFollower(std::shared_ptr<puck::TcpConnection> con, const json& j);
 
   void OnMessageCandidate(std::shared_ptr<puck::TcpConnection> con, const json& j);
 
-  // Follower 和 Candidate具有相同的处理逻辑
   AppendEntriesReply HandleAppendEntries(const AppendEntries& ae);
 
   RequestVoteReply HandleRequestVote(const RequestVote& rv);
@@ -88,6 +91,8 @@ public:
 
   void NodeLeave(std::shared_ptr<puck::TcpConnection> con);
 
+  void ClientLeave(std::shared_ptr<puck::TcpConnection> con);
+
 private:
   State state_;
   asio::io_context& io_;
@@ -98,6 +103,20 @@ private:
   // valid on leader state.
   std::unordered_map<uint64_t, uint64_t> next_index_;
   std::unordered_map<uint64_t, uint64_t> match_index_;
+  // 提交propose的客户端[id, client]
+  struct ClientContext {
+    uint64_t id;
+    std::shared_ptr<puck::TcpConnection> client;
+
+    ClientContext(uint64_t id = 0, std::shared_ptr<puck::TcpConnection> client = nullptr) :
+                  id(id),
+                  client(client) {
+
+    }
+  };
+
+  // [propose's index, client_context]
+  std::unordered_map<uint64_t, ClientContext> real_clients_;
 
   uint64_t current_term_;
   // voted_for_ == -1 means not vote in current term.

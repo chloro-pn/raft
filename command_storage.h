@@ -11,6 +11,10 @@ namespace raft {
 struct Item {
   uint64_t term_;
   std::string command_;
+
+  Item(uint64_t t, const std::string& c) : term_(t), command_(c) {
+
+  }
 };
 
 class CommandStorage {
@@ -18,9 +22,7 @@ public:
   CommandStorage() : logs_() {
     // logs_ first index == 1，所以需要在开头放一个空的item
     // 第一条日志的term一定是0
-    Item item;
-    item.term_ = 0;
-    item.command_.clear();
+    Item item {0, ""};
     logs_.push_back(item);
   }
 
@@ -78,17 +80,17 @@ public:
     return true;
   }
 
+  // fix stupid bug.
   void RewriteOrAppendAfter(uint64_t index, uint64_t current_term, const std::vector<std::string>& logs) {
     assert(index < logs_.size());
     uint64_t count = 0;
     for(uint64_t i = index + 1; i < logs_.size() && count < logs.size(); ++i) {
+      logs_[i].term_ = current_term;
       logs_[i].command_ = logs[count];
       ++count;
     }
     for(uint64_t i = count; i < logs.size(); ++i) {
-      Item tmp;
-      tmp.term_ = current_term;
-      tmp.command_ = logs[i];
+      Item tmp {current_term, logs[i]};
       logs_.push_back(tmp);
     }
   }

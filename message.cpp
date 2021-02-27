@@ -50,6 +50,7 @@ std::string CreateAppendEntries(const AppendEntries& ae) {
   for(const auto& each : ae.entries) {
     j["entries"].push_back(each);
   }
+  j["heart_beat"] = ae.heart_beat;
   return j.dump();
 }
 
@@ -65,6 +66,7 @@ AppendEntries GetAppendEntries(const json& j) {
     }
   }
   ae.leader_commit = j["leader_commit"].get<uint64_t>();
+  ae.heart_beat = j["heart_beat"].get<bool>();
   return ae;
 }
 
@@ -74,6 +76,7 @@ std::string CreateAppendEntriesReply(const AppendEntriesReply& aer) {
   j["term"] = aer.term;
   j["success"] = aer.success;
   j["next_index"] = aer.next_index;
+  j["heart_beat"] = aer.heart_beat;
   return j.dump();
 }
 
@@ -82,6 +85,7 @@ AppendEntriesReply GetAppendEntriesReply(const json& j) {
   aer.term = j["term"].get<uint64_t>();
   aer.success = j["success"].get<bool>();
   aer.next_index = j["next_index"].get<uint64_t>();
+  aer.heart_beat = j["heart_beat"].get<bool>();
   return aer;
 }
 
@@ -108,8 +112,7 @@ std::string CreateProposeReply(const ProposeReply& p) {
 }
 
 ProposeReply GetProposeReply(const json& j) {
-  ProposeReply pr;
-  pr.id = j["index"].get<uint64_t>();
+  ProposeReply pr {j["index"].get<uint64_t>()};
   return pr;
 }
 
