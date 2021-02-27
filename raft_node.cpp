@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <limits>
+#include <memory>
 
 static uint16_t get_server_port_from_config() {
   uint64_t mid = raft::Config::instance().MyId();
@@ -42,9 +43,9 @@ static bool all_connected(uint64_t count) {
   return raft::Config::instance().Nodes().size() == count + 1;
 }
 
-// random timeout from 150 to 200 ms.
+// random timeout from 150 to 300 ms.
 static asio::chrono::milliseconds get_random_election_timeout() {
-  return asio::chrono::milliseconds(puck::util::GetRandomFromTo(150, 150));
+  return asio::chrono::milliseconds(puck::util::GetRandomFromTo(150, 300));
 }
 
 static asio::chrono::milliseconds get_candidate_timeout() {
@@ -64,6 +65,8 @@ RaftNode::RaftNode(asio::io_context& io) : state_(RaftNode::State::Init),
                                            current_term_(0),
                                            voted_for_(-1),
                                            leader_id_(-1),
+                                           // need c++14
+                                           logs_(std::make_unique<CommandStorage>()),
                                            commit_index_(0),
                                            last_applied_(0),
                                            server_(io_, get_server_port_from_config()),
@@ -108,7 +111,8 @@ RaftNode::RaftNode(asio::io_context& io) : state_(RaftNode::State::Init),
       assert(state_ == State::Init);
       if(all_connected(other_nodes_.size())) {
         INFO("node ", my_id_, " start.");
-        BecomeFollower(0, -1);
+        logs_->Init();
+        BecomeFollower(logs_->GetCurrentTerm(), -1, logs_->GetVotedFor());
       }
     });
 
@@ -129,17 +133,17 @@ RaftNode::RaftNode(asio::io_context& io) : state_(RaftNode::State::Init),
 }
 
 // BUG FIX
-void RaftNode::BecomeFollower(uint64_t new_term_, int64_t new_leader_) {
+void RaftNode::BecomeFollower(uint64_t new_term, int64_t new_leader, int64_t voted_for) {
   INFO("node ", my_id_, " become follower from ", GetStateStr());
   if(state_ == State::Leader) {
     // 从leader变成follower，及时向客户端回复ddos
     DdosAllClient();
   }
   state_ = State::Follower;
-  if(new_term_ > current_term_) {
-    current_term_ = new_term_;
-    voted_for_ = -1;
-    leader_id_ = new_leader_;
+  if(new_term > current_term_) {
+    current_term_ = new_term;
+    voted_for_ = voted_for;
+    leader_id_ = new_leader;
   }
   StartFollowerTimer();
 }
@@ -185,14 +189,15 @@ void RaftNode::BecomeCandidate() {
 }
 
 void RaftNode::RunForLeader() {
+  logs_->Storage(current_term_, my_id_);
   voted_for_ = my_id_;
   ++voted_count_;
 
   RequestVote rv;
   rv.term = current_term_;
   rv.candidate_id = my_id_;
-  rv.last_log_index = logs_.GetLastLogIndex();
-  rv.last_log_term = logs_.GetLastLogTerm();
+  rv.last_log_index = logs_->GetLastLogIndex();
+  rv.last_log_term = logs_->GetLastLogTerm();
 
   std::string message = CreateRequestVote(rv);
   for(auto& each : other_nodes_) {
@@ -223,7 +228,7 @@ void RaftNode::BecomeLeader() {
 
   // init next_index_ and match_index_
   for(auto& each : other_nodes_) {
-    next_index_[each.first] = logs_.GetLastLogIndex() + 1;
+    next_index_[each.first] = logs_->GetLastLogIndex() + 1;
     match_index_[each.first] = 0;
   }
   SendHeartBeat();
@@ -256,8 +261,8 @@ void RaftNode::AppendEntriesToOthers() {
     // next_index_ always > 0.
     uint64_t prev_log_index = next_index_[each.first] - 1;
     ae.prev_log_index = prev_log_index;
-    ae.prev_log_term = logs_.GetTermFromIndex(prev_log_index);
-    ae.entries = logs_.GetLogsAfterPrevLog(ae.prev_log_index);
+    ae.prev_log_term = logs_->GetTermFromIndex(prev_log_index);
+    ae.entries = logs_->GetLogsAfterPrevLog(ae.prev_log_index);
 
     std::string message = CreateAppendEntries(ae);
     each.second->Send(message);
@@ -276,7 +281,7 @@ void RaftNode::SendHeartBeat() {
     // next_index_ always > 0.
     uint64_t prev_log_index = next_index_[each.first] - 1;
     ae.prev_log_index = prev_log_index;
-    ae.prev_log_term = logs_.GetTermFromIndex(prev_log_index);
+    ae.prev_log_term = logs_->GetTermFromIndex(prev_log_index);
     ae.entries.clear();
 
     std::string message = CreateAppendEntries(ae);
@@ -346,7 +351,7 @@ void RaftNode::OnMessageInit(std::shared_ptr<puck::TcpConnection> con, const jso
     ERROR("node ", my_id_, " get error type message :", j["type"].get<std::string>(), "on state init.");
   }
   id = j["id"].get<uint64_t>();
-  if(other_nodes_.find(id) != other_nodes_.end() || my_id_ == id) {
+  if(other_nodes_.find(id) != other_nodes_.end() || static_cast<int64_t>(my_id_) == id) {
     ERROR("duplicate id : ", id);
   }
   other_nodes_[id] = con;
@@ -355,6 +360,8 @@ void RaftNode::OnMessageInit(std::shared_ptr<puck::TcpConnection> con, const jso
   assert(state_ == State::Init);
   if(all_connected(other_nodes_.size())) {
     INFO("node ", my_id_, " start.");
+    logs_->Init();
+    BecomeFollower(logs_->GetCurrentTerm(), -1, logs_->GetVotedFor());
     BecomeFollower(0, -1);
   }
 }
@@ -434,11 +441,11 @@ AppendEntriesReply RaftNode::HandleAppendEntries(const AppendEntries& ae) {
       aer.next_index = 0;
       return aer;
     }
-    if(logs_.Check(ae.prev_log_index, ae.prev_log_term) == true) {
-      logs_.RewriteOrAppendAfter(ae.prev_log_index, current_term_, ae.entries);
+    if(logs_->Check(ae.prev_log_index, ae.prev_log_term) == true) {
+      logs_->RewriteOrAppendAfter(ae.prev_log_index, current_term_, ae.entries);
       aer.next_index = ae.prev_log_index + ae.entries.size() + 1;
       if(ae.leader_commit > commit_index_) {
-        commit_index_ = std::min(static_cast<uint64_t>(logs_.Size() - 1), ae.leader_commit);
+        commit_index_ = std::min(static_cast<uint64_t>(logs_->Size() - 1), ae.leader_commit);
       }
       ApplyToStateMachine();
     } else {
@@ -464,7 +471,10 @@ RequestVoteReply RaftNode::HandleRequestVote(const RequestVote& rv) {
   }
 
   if(rv.term == current_term_ && voted_for_ == -1) {
-    if(logs_.MoreOrEqualUpToDate(rv.last_log_index, rv.last_log_term)) {
+    if(logs_->MoreOrEqualUpToDate(rv.last_log_index, rv.last_log_term)) {
+      // 在投票前持久化投票信息，这样可能导致重启后少一次投票
+      // 但避免了同一个term内投多次票
+      logs_->Storage(current_term_, rv.candidate_id);
       rvr.vote_granted = true;
       voted_for_ = rv.candidate_id;
       INFO("node ", my_id_, " vote for node ", rv.candidate_id, " in term ", rv.term);
@@ -477,8 +487,8 @@ void RaftNode::OnMessageLeader(std::shared_ptr<puck::TcpConnection> con, const j
   if(j["type"].get<std::string>() == "propose") {
     Propose p = GetPropose(j);
     Item tmp {current_term_, p.command};
-    logs_.Storage(tmp);
-    real_clients_[logs_.GetLastLogIndex()] = ClientContext{p.id, con};
+    logs_->Storage(tmp);
+    real_clients_[logs_->GetLastLogIndex()] = ClientContext{p.id, con};
     con->SetContext(std::make_shared<uint64_t>(CLIENT_CONTEXT));
   } else if(j["type"].get<std::string>() == "append_entries_reply") {
     AppendEntriesReply aer = GetAppendEntriesReply(j);
@@ -556,13 +566,13 @@ void RaftNode::UpdateCommitIndexFromMatchIndex() {
   // 3th == array[3 - 1];
   uint64_t should_commit = match_indexs[total_size / 2];
   // 注意， 本term不能直接提交以前term的日志
-  if(current_term_ == logs_.GetTermFromIndex(should_commit)) {
+  if(current_term_ == logs_->GetTermFromIndex(should_commit)) {
     assert(commit_index_ >= should_commit);
     commit_index_ = should_commit;
     // Done : update last_applied_ form commit_index_;
     ApplyToStateMachine();
   } else {
-    assert(current_term_ > logs_.GetTermFromIndex(should_commit));
+    assert(current_term_ > logs_->GetTermFromIndex(should_commit));
   }
 }
 
@@ -571,7 +581,7 @@ void RaftNode::ApplyToStateMachine() {
   while(last_applied_ < commit_index_) {
     ++last_applied_;
     if(cb_) {
-      cb_(logs_.GetCommandFromIndex(last_applied_));
+      cb_(logs_->GetCommandFromIndex(last_applied_));
       if(real_clients_.find(last_applied_) != real_clients_.end()) {
         auto id = real_clients_[last_applied_].id;
         auto client = real_clients_[last_applied_].client;

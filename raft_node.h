@@ -49,7 +49,7 @@ public:
     cb_ = cb;
   }
 
-  void BecomeFollower(uint64_t new_term_, int64_t new_leader_);
+  void BecomeFollower(uint64_t new_term, int64_t new_leader, int64_t voted_for = -1);
 
   void StartFollowerTimer();
 
@@ -123,7 +123,7 @@ private:
   int64_t voted_for_;
   // 当不知道当前leader是谁时，leader_id_ == -1.
   int64_t leader_id_;
-  CommandStorage logs_;
+  std::unique_ptr<StorageEngineBase> logs_;
   uint64_t commit_index_;
   uint64_t last_applied_;
   std::function<void(const std::string&)> cb_;
