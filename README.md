@@ -24,3 +24,10 @@ TODO:
 6. 保证写的幂等性，注意raft不保证每个command只被执行一次（实际上只要涉及WAL和不可靠网络通信，就无法存在exactly-once保证）
 
 参考url：
+https://www.zhihu.com/question/302761390
+https://segmentfault.com/a/1190000038171007?utm_source=tag-newest
+https://segmentfault.com/a/1190000038170990?utm_source=tag-newest
+https://zhuanlan.zhihu.com/p/130245819
+https://zhuanlan.zhihu.com/p/113149149
+https://zhuanlan.zhihu.com/p/64405742
+https://zhuanlan.zhihu.com/p/22820761
